@@ -24,7 +24,7 @@ external_components:
 deep_sleep:
   id: deep_sleep_1
   wakeup_pin: GPIO2
-  run_duration: 60s  # Don't run at all, we'll use external wake up
+  run_duration: 30s  # Max run duration before forced sleep
   sleep_duration: 24h  # Sleep until external wake up
   
 
@@ -59,6 +59,7 @@ binary_sensor:
           color: BLUE
           speed: 0
           count: 0          
+      - deep_sleep.enter: deep_sleep_1
 
 # Fingerprint sensor configuration
 fingerprint_grow:
@@ -85,12 +86,14 @@ fingerprint_grow:
         speed: 50
         color: RED
         count: 2
+    - deep_sleep.enter: deep_sleep_1
   on_finger_scan_unmatched:
     - fingerprint_grow.aura_led_control:
         state: FLASHING
         speed: 25
         color: RED
         count: 2
+    - deep_sleep.enter: deep_sleep_1
   on_enrollment_done :
     - lambda: |-
         ESP_LOGI("main", "Fingerprint enrolled successfully!");
