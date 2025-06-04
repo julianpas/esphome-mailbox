@@ -1,0 +1,142 @@
+esphome:
+  name: mailbox
+  friendly_name: Mailbox Lock
+
+esp32:
+  board: esp32-c6-devkitm-1
+  variant: ESP32C6
+  framework: 
+    type: esp-idf
+    version: 5.3.1
+    platform_version: 6.9.0
+
+#This is to make sure adc compiles or else it will throw an error
+external_components:
+  - source:
+      # https://github.com/lboue/esphome/blob/adc_oneshot/esphome/components/adc
+      type: git
+      url: https://github.com/lboue/esphome
+      ref: adc_oneshot
+    components: [ adc ]
+    refresh: 0s
+
+# Enable deep sleep
+deep_sleep:
+  id: deep_sleep_1
+  wakeup_pin: GPIO2
+  run_duration: 60s  # Don't run at all, we'll use external wake up
+  sleep_duration: 24h  # Sleep until external wake up
+  
+
+# UART configuration for fingerprint sensor
+uart:
+  - id: uart_2
+    tx_pin: GPIO5  # Adjust these pins based on your wiring
+    rx_pin: GPIO4
+    baud_rate: 57600
+
+# Global variables
+globals:
+  - id: learning_mode
+    type: bool
+    initial_value: 'false'
+
+# Boot button configuration
+binary_sensor:
+  - platform: gpio
+    id: boot_button
+    pin:
+      number: GPIO9 
+    on_release:
+      - lambda: |-
+          if (id(learning_mode)) {
+            id(learning_mode) = false;
+          } else {
+            id(learning_mode) = false;
+          }
+      - fingerprint_grow.aura_led_control:
+          state: ALWAYS_ON
+          color: BLUE
+          speed: 0
+          count: 0          
+
+# Fingerprint sensor configuration
+fingerprint_grow:
+  id: fingerprint_sensor
+  uart_id: uart_2
+  on_finger_scan_matched:
+    - if:
+        condition:
+          lambda: 'return !id(learning_mode);'
+        then:
+          - fingerprint_grow.aura_led_control:
+              state: BREATHING
+              speed: 200
+              color: BLUE
+              count: 1
+          - switch.turn_on: relay
+          - delay: 1s
+          - switch.turn_off: relay
+          - deep_sleep.enter:
+              id: deep_sleep_1
+  on_finger_scan_invalid:
+    - fingerprint_grow.aura_led_control:
+        state: FLASHING
+        speed: 50
+        color: RED
+        count: 2
+  on_finger_scan_unmatched:
+    - fingerprint_grow.aura_led_control:
+        state: FLASHING
+        speed: 25
+        color: RED
+        count: 2
+  on_enrollment_done :
+    - lambda: |-
+        ESP_LOGI("main", "Fingerprint enrolled successfully!");
+        id(learning_mode) = false;
+    - deep_sleep.enter:
+        id: deep_sleep_1
+
+# Relay configuration
+switch:
+  - platform: gpio
+    id: relay
+    pin: GPIO3
+    name: "Lock Relay"
+    restore_mode: ALWAYS_OFF
+  - platform: gpio
+    id: fingerprint_power
+    pin: GPIO6
+    restore_mode: ALWAYS_ON
+  - platform: restart
+    id: restart_button
+    name: Reboot
+
+# Enable logging
+logger:
+  level: DEBUG 
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret mailbox_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret mailbox_ota_password
+
+# WiFi configuration
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: HIGH
+
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Mailbox Fallback Hotspot"
+    password: !secret mailbox_ap_password
+
+captive_portal:
+    
