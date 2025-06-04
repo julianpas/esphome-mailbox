@@ -1,6 +1,15 @@
 esphome:
   name: mailbox
   friendly_name: Mailbox Lock
+  on_boot:
+    - priority: 0.0  # Run late after sensors hopefully initialize
+      then:
+        - delay: 2s   # Wait for sensor states to propagate
+        - globals.set:
+            id: next_fingerprint_slot
+            value: !lambda 'return id(fingerprint_total_enrolled).state;'
+          - lambda: |-
+              ESP_LOGI("main", "Next fingerprint slot initialized to: %d", id(next_fingerprint_slot));
 
 esp32:
   board: esp32-c6-devkitm-1
@@ -40,37 +49,58 @@ globals:
   - id: learning_mode
     type: bool
     initial_value: 'false'
+  - id: enrollment_in_progress
+    type: bool
+    initial_value: 'false'
+  - id: next_fingerprint_slot
+    type: int
+    # initial_value is removed, will be set by on_boot
 
 # Boot button configuration
 binary_sensor:
   - platform: gpio
     id: boot_button
     pin:
-      number: GPIO9 
-    on_release:
+      number: GPIO9
+      inverted: true  # Added inverted: true
+    on_press:         # Changed from on_release to on_press
+      # Old learning_mode lambda removed
+      - globals.set:
+          id: enrollment_in_progress
+          value: 'true'
       - lambda: |-
-          if (id(learning_mode)) {
-            id(learning_mode) = false;
-          } else {
-            id(learning_mode) = false;
-          }
+          ESP_LOGI("main", "Enrollment started. Target slot: %d", id(next_fingerprint_slot));
+      - fingerprint_grow.enroll:
+          finger_id: !lambda 'return id(next_fingerprint_slot);'
+          num_scans: 2 # Explicitly set num_scans for clarity
       - fingerprint_grow.aura_led_control:
-          state: ALWAYS_ON
+          id: fingerprint_sensor # Assuming this is the ID of your fingerprint_grow component
+          state: BREATHING
           color: BLUE
-          speed: 0
-          count: 0          
-      - deep_sleep.enter: deep_sleep_1
+          speed: 200 # For "slow pulsing"
+          count: 0   # 0 for infinite
+
+sensor:
+  - platform: fingerprint_grow
+    fingerprint_id: fingerprint_sensor # Links to the fingerprint_grow component
+    fingerprint_count:
+      name: "Mailbox Fingerprint Count"
+      id: fingerprint_total_enrolled
 
 # Fingerprint sensor configuration
 fingerprint_grow:
   id: fingerprint_sensor
   uart_id: uart_2
   on_finger_scan_matched:
-    - if:
+    - if: # New outer condition
         condition:
-          lambda: 'return !id(learning_mode);'
+          lambda: 'return !id(enrollment_in_progress);'
         then:
+          - lambda: |-
+              ESP_LOGI("fingerprint", "Finger matched. ID: %d, Confidence: %d", finger_id, confidence);
+          # Original actions, minus the learning_mode check which is no longer primary
           - fingerprint_grow.aura_led_control:
+              id: fingerprint_sensor # ensure id is present
               state: BREATHING
               speed: 200
               color: BLUE
@@ -78,28 +108,108 @@ fingerprint_grow:
           - switch.turn_on: relay
           - delay: 1s
           - switch.turn_off: relay
-          - deep_sleep.enter:
-              id: deep_sleep_1
+          - deep_sleep.enter: deep_sleep_1
   on_finger_scan_invalid:
-    - fingerprint_grow.aura_led_control:
-        state: FLASHING
-        speed: 50
-        color: RED
-        count: 2
-    - deep_sleep.enter: deep_sleep_1
+    - if:
+        condition:
+          lambda: 'return !id(enrollment_in_progress);'
+        then:
+          - lambda: |-
+              ESP_LOGW("fingerprint", "Unmatched finger scan detected.");
+          - fingerprint_grow.aura_led_control:
+              id: fingerprint_sensor # ensure id is present
+              state: FLASHING
+              speed: 50
+              color: RED
+              count: 2
+          - deep_sleep.enter: deep_sleep_1
   on_finger_scan_unmatched:
-    - fingerprint_grow.aura_led_control:
-        state: FLASHING
-        speed: 25
-        color: RED
-        count: 2
-    - deep_sleep.enter: deep_sleep_1
-  on_enrollment_done :
+    - if:
+        condition:
+          lambda: 'return !id(enrollment_in_progress);'
+        then:
+          - lambda: |-
+              ESP_LOGW("fingerprint", "Invalid finger scan detected (e.g., poor placement).");
+          - fingerprint_grow.aura_led_control:
+              id: fingerprint_sensor # ensure id is present
+              state: FLASHING
+              speed: 25
+              color: RED
+              count: 2
+          - deep_sleep.enter: deep_sleep_1
+  on_finger_scan_start:
     - lambda: |-
-        ESP_LOGI("main", "Fingerprint enrolled successfully!");
-        id(learning_mode) = false;
-    - deep_sleep.enter:
-        id: deep_sleep_1
+        if (id(enrollment_in_progress)) {
+          ESP_LOGD("fingerprint", "Scan started (Enrollment in progress)");
+        } else {
+          ESP_LOGD("fingerprint", "Scan started (Normal operation)");
+        }
+    - if:
+        condition:
+          lambda: 'return id(enrollment_in_progress);'
+        then:
+          - fingerprint_grow.aura_led_control:
+              id: fingerprint_sensor
+              state: BREATHING # Slow pulsing blue for waiting for 1st or 2nd touch
+              color: BLUE
+              speed: 200
+              count: 0
+  on_enrollment_scan:
+    - lambda: |-
+        ESP_LOGD("fingerprint", "Enrollment scan: %d for finger_id: %d", scan_num, finger_id);
+    - if:
+        condition:
+          lambda: 'return scan_num == 1;' # After 1st scan of 2
+        then:
+          - fingerprint_grow.aura_led_control:
+              id: fingerprint_sensor
+              state: FLASHING   # "quick blinking blue" to signal lift finger
+              color: BLUE
+              speed: 50         # Quick
+              count: 3          # Blink a few times then rely on on_finger_scan_start for next phase
+  on_enrollment_done:
+    - lambda: |-
+        ESP_LOGI("fingerprint", "Enrollment successful for finger_id: %d", finger_id);
+    - fingerprint_grow.aura_led_control:
+        id: fingerprint_sensor
+        state: ALWAYS_ON
+        color: BLUE
+        speed: 0
+        count: 0 # Solid blue
+    - delay: 1s
+    - fingerprint_grow.aura_led_control: # Turn LED off
+        id: fingerprint_sensor
+        state: ALWAYS_OFF
+        color: BLUE # Color doesn't matter for OFF
+        speed: 0
+        count: 0
+    - globals.set:
+        id: next_fingerprint_slot
+        value: !lambda 'return id(next_fingerprint_slot) + 1;'
+    - globals.set:
+        id: enrollment_in_progress
+        value: 'false'
+    - deep_sleep.enter: deep_sleep_1
+  on_enrollment_failed:
+    - lambda: |-
+        ESP_LOGW("fingerprint", "Enrollment failed for finger_id: %d", finger_id); # Using ESP_LOGW for warning
+    - fingerprint_grow.aura_led_control:
+        id: fingerprint_sensor
+        state: FLASHING   # "quick blinking red"
+        color: RED
+        speed: 50
+        count: 5          # Blink 5 times
+    - delay: 1s # Let user see blinking
+    - fingerprint_grow.aura_led_control: # Turn LED off
+        id: fingerprint_sensor
+        state: ALWAYS_OFF
+        color: RED # Color doesn't matter for OFF
+        speed: 0
+        count: 0
+    - globals.set:
+        id: enrollment_in_progress
+        value: 'false'
+    - deep_sleep.enter: deep_sleep_1
 
 # Relay configuration
 switch:
