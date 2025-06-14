@@ -1,15 +1,6 @@
 esphome:
   name: mailbox
   friendly_name: Mailbox Lock
-  on_boot:
-    - priority: 0.0  # Run late after sensors hopefully initialize
-      then:
-        - delay: 2s   # Wait for sensor states to propagate
-        - globals.set:
-            id: next_fingerprint_slot
-            value: !lambda 'return id(fingerprint_total_enrolled).state;'
-          - lambda: |-
-              ESP_LOGI("main", "Next fingerprint slot initialized to: %d", id(next_fingerprint_slot));
 
 esp32:
   board: esp32-c6-devkitm-1
@@ -27,20 +18,20 @@ external_components:
       url: https://github.com/lboue/esphome
       ref: adc_oneshot
     components: [ adc ]
-    refresh: 0s
 
 # Enable deep sleep
 deep_sleep:
   id: deep_sleep_1
   wakeup_pin: GPIO2
-  run_duration: 30s  # Max run duration before forced sleep
-  sleep_duration: 24h  # Sleep until external wake up
-  
+  wakeup_pin_mode: INVERT_WAKEUP
+  run_duration: 30s
+  sleep_duration: 6h
+    
 
 # UART configuration for fingerprint sensor
 uart:
   - id: uart_2
-    tx_pin: GPIO5  # Adjust these pins based on your wiring
+    tx_pin: GPIO5
     rx_pin: GPIO4
     baud_rate: 57600
 
@@ -54,7 +45,45 @@ globals:
     initial_value: 'false'
   - id: next_fingerprint_slot
     type: int
-    # initial_value is removed, will be set by on_boot
+    initial_value: '6'
+
+# Relay configuration
+switch:
+  - platform: gpio
+    id: relay
+    pin: GPIO3
+    name: "Lock Relay"
+    restore_mode: ALWAYS_OFF
+    on_turn_on: 
+      then:
+        - deep_sleep.prevent: deep_sleep_1
+        - delay: 1.5s
+        - switch.turn_off: relay
+        - deep_sleep.allow: deep_sleep_1
+  - platform: gpio
+    id: fingerprint_power
+    pin: 
+      number: GPIO6
+      mode: 
+        output: true
+        pulldown: true
+    inverted: False
+    restore_mode: ALWAYS_OFF        
+  - platform: restart
+    id: restart_button
+    name: Reboot
+
+sensor:
+  - platform: adc
+    pin: GPIO0
+    id: battery_voltage
+    name: "Battery voltage"
+    filters:
+     - multiply: 2  # 2×1MΩ voltage divider
+  - platform: template
+    name: "Wakeup Cause"
+    accuracy_decimals: 0
+    lambda: return esp_sleep_get_wakeup_cause();
 
 # Boot button configuration
 binary_sensor:
@@ -62,9 +91,9 @@ binary_sensor:
     id: boot_button
     pin:
       number: GPIO9
-      inverted: true  # Added inverted: true
-    on_press:         # Changed from on_release to on_press
-      # Old learning_mode lambda removed
+      inverted: true  
+    on_press:         
+      - deep_sleep.prevent: deep_sleep_1
       - globals.set:
           id: enrollment_in_progress
           value: 'true'
@@ -72,43 +101,32 @@ binary_sensor:
           ESP_LOGI("main", "Enrollment started. Target slot: %d", id(next_fingerprint_slot));
       - fingerprint_grow.enroll:
           finger_id: !lambda 'return id(next_fingerprint_slot);'
-          num_scans: 2 # Explicitly set num_scans for clarity
+          num_scans: 2
       - fingerprint_grow.aura_led_control:
-          id: fingerprint_sensor # Assuming this is the ID of your fingerprint_grow component
+          id: fingerprint_sensor
           state: BREATHING
           color: BLUE
-          speed: 200 # For "slow pulsing"
-          count: 0   # 0 for infinite
-
-sensor:
-  - platform: fingerprint_grow
-    fingerprint_id: fingerprint_sensor # Links to the fingerprint_grow component
-    fingerprint_count:
-      name: "Mailbox Fingerprint Count"
-      id: fingerprint_total_enrolled
+          speed: 200
+          count: 0
 
 # Fingerprint sensor configuration
 fingerprint_grow:
   id: fingerprint_sensor
   uart_id: uart_2
   on_finger_scan_matched:
-    - if: # New outer condition
+    - if:
         condition:
           lambda: 'return !id(enrollment_in_progress);'
         then:
           - lambda: |-
               ESP_LOGI("fingerprint", "Finger matched. ID: %d, Confidence: %d", finger_id, confidence);
-          # Original actions, minus the learning_mode check which is no longer primary
           - fingerprint_grow.aura_led_control:
-              id: fingerprint_sensor # ensure id is present
+              id: fingerprint_sensor
               state: BREATHING
               speed: 200
               color: BLUE
               count: 1
           - switch.turn_on: relay
-          - delay: 1s
-          - switch.turn_off: relay
-          - deep_sleep.enter: deep_sleep_1
   on_finger_scan_invalid:
     - if:
         condition:
@@ -117,12 +135,12 @@ fingerprint_grow:
           - lambda: |-
               ESP_LOGW("fingerprint", "Unmatched finger scan detected.");
           - fingerprint_grow.aura_led_control:
-              id: fingerprint_sensor # ensure id is present
+              id: fingerprint_sensor
               state: FLASHING
               speed: 50
               color: RED
               count: 2
-          - deep_sleep.enter: deep_sleep_1
+          - deep_sleep.allow: deep_sleep_1
   on_finger_scan_unmatched:
     - if:
         condition:
@@ -131,12 +149,12 @@ fingerprint_grow:
           - lambda: |-
               ESP_LOGW("fingerprint", "Invalid finger scan detected (e.g., poor placement).");
           - fingerprint_grow.aura_led_control:
-              id: fingerprint_sensor # ensure id is present
+              id: fingerprint_sensor
               state: FLASHING
               speed: 25
               color: RED
               count: 2
-          - deep_sleep.enter: deep_sleep_1
+          - deep_sleep.allow: deep_sleep_1
   on_finger_scan_start:
     - lambda: |-
         if (id(enrollment_in_progress)) {
@@ -150,7 +168,7 @@ fingerprint_grow:
         then:
           - fingerprint_grow.aura_led_control:
               id: fingerprint_sensor
-              state: BREATHING # Slow pulsing blue for waiting for 1st or 2nd touch
+              state: BREATHING
               color: BLUE
               speed: 200
               count: 0
@@ -163,10 +181,10 @@ fingerprint_grow:
         then:
           - fingerprint_grow.aura_led_control:
               id: fingerprint_sensor
-              state: FLASHING   # "quick blinking blue" to signal lift finger
+              state: FLASHING
               color: BLUE
-              speed: 50         # Quick
-              count: 3          # Blink a few times then rely on on_finger_scan_start for next phase
+              speed: 50
+              count: 3
   on_enrollment_done:
     - lambda: |-
         ESP_LOGI("fingerprint", "Enrollment successful for finger_id: %d", finger_id);
@@ -175,12 +193,12 @@ fingerprint_grow:
         state: ALWAYS_ON
         color: BLUE
         speed: 0
-        count: 0 # Solid blue
+        count: 0
     - delay: 1s
-    - fingerprint_grow.aura_led_control: # Turn LED off
+    - fingerprint_grow.aura_led_control:
         id: fingerprint_sensor
         state: ALWAYS_OFF
-        color: BLUE # Color doesn't matter for OFF
+        color: BLUE
         speed: 0
         count: 0
     - globals.set:
@@ -189,48 +207,32 @@ fingerprint_grow:
     - globals.set:
         id: enrollment_in_progress
         value: 'false'
-    - deep_sleep.enter: deep_sleep_1
+    - deep_sleep.allow: deep_sleep_1
   on_enrollment_failed:
     - lambda: |-
-        ESP_LOGW("fingerprint", "Enrollment failed for finger_id: %d", finger_id); # Using ESP_LOGW for warning
+        ESP_LOGW("fingerprint", "Enrollment failed for finger_id: %d", finger_id);
     - fingerprint_grow.aura_led_control:
         id: fingerprint_sensor
-        state: FLASHING   # "quick blinking red"
+        state: FLASHING
         color: RED
         speed: 50
-        count: 5          # Blink 5 times
-    - delay: 1s # Let user see blinking
-    - fingerprint_grow.aura_led_control: # Turn LED off
+        count: 5
+    - delay: 1s
+    - fingerprint_grow.aura_led_control:
         id: fingerprint_sensor
         state: ALWAYS_OFF
-        color: RED # Color doesn't matter for OFF
+        color: RED
         speed: 0
         count: 0
     - globals.set:
         id: enrollment_in_progress
         value: 'false'
-    - deep_sleep.enter: deep_sleep_1
-
-# Relay configuration
-switch:
-  - platform: gpio
-    id: relay
-    pin: GPIO3
-    name: "Lock Relay"
-    restore_mode: ALWAYS_OFF
-  - platform: gpio
-    id: fingerprint_power
-    pin: GPIO6
-    restore_mode: ALWAYS_ON
-  - platform: restart
-    id: restart_button
-    name: Reboot
+    - deep_sleep.allow: deep_sleep_1
 
 # Enable logging
 logger:
   level: DEBUG 
 
-# Enable Home Assistant API
 api:
   encryption:
     key: !secret mailbox_encryption_key
@@ -239,17 +241,11 @@ ota:
   - platform: esphome
     password: !secret mailbox_ota_password
 
-# WiFi configuration
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
   power_save_mode: HIGH
 
-
-  # Enable fallback hotspot (captive portal) in case wifi connection fails
   ap:
     ssid: "Mailbox Fallback Hotspot"
     password: !secret mailbox_ap_password
-
-captive_portal:
-    
